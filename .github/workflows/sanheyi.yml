@@ -1,0 +1,512 @@
+name: Mobile Build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      target_repo:
+        description: 'Source Repository (owner/repo)'
+        required: true
+        default: 't: 'chinaxsir/prism-Alpha'
+      target_ref:
+        description: 'Branch or Tag to build'
+        required: true
+        default: 'main'
+
+permissions:
+  contents: write
+
+jobs:
+  android:
+    name: Build Android APK
+    runs-on: ubuntu-24.04
+    env:
+      NDK_HOME: /usr/local/lib/android/sdk/ndk/27.2.12479018
+    steps:
+      - name: Free disk space
+        shell: bash
+        run: |
+          set +e
+          echo "--- disk before ---"; df -h / | tail -1
+          sudo docker image prune -af >/dev/null 2>&1
+          sudo rm -rf /usr/share/dotnet /usr/local/share/boost \
+            /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL \
+            /opt/hostedtoolcache/PyPy /usr/local/go \
+            "$VCPKG_INSTALLATION_ROOT"
+          sudo rm -rf /usr/local/lib/android/sdk/system-images \
+            /usr/local/lib/android/sdk/emulator \
+            /usr/local/lib/android/sdk/ndk-bundle \
+            /usr/local/lib/android/sdk/tools
+          sudo find /usr/local/lib/android/sdk/ndk -mindepth 1 -maxdepth 1 \
+            ! -name "27.2.12479018" -exec rm -rf {} +
+          sudo find /usr/local/lib/android/sdk/build-tools -mindepth 1 -maxdepth 1 \
+            ! -name "34.0.0" ! -name "35.0.0" -exec rm -rf {} +
+          sudo find /usr/local/lib/android/sdk/platforms -mindepth 1 -maxdepth 1 \
+            ! -name "android-34" ! -name "android-35" -exec rm -rf {} +
+          sudo apt-get clean
+          echo "--- disk after ---"; df -h / | tail -1
+
+      # 跨账号拉取私有仓库代码
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ github.event.inputs.target_repo || '你的主账号用户名/主仓库名' }}
+          ref: ${{ github.event.inputs.target_ref || github.ref }}
+          token: ${{ secrets.REMOTE_PAT }}
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Setup JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: >-
+            platform-tools
+            platforms;android-34
+            platforms;android-35
+            build-tools;34.0.0
+            build-tools;35.0.0
+            ndk;27.2.12479018
+
+      - name: Accept SDK licenses
+        run: yes | sdkmanager --licenses || true
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+          cache-dependency-path: src-tauri/ios-kernel/go.sum
+
+      - name: Configure cargo NDK toolchain globally
+        shell: bash
+        run: |
+          BIN="$NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          CFG="${CARGO_HOME:-$HOME/.cargo}/config.toml"
+          mkdir -p "$(dirname "$CFG")"
+          if grep -q "prism-android-ndk" "$CFG" 2>/dev/null; then
+            echo "NDK toolchain already configured"
+            exit 0
+          fi
+          cat >> "$CFG" <<EOF
+
+          [target.aarch64-linux-android]
+          linker = "$BIN/aarch64-linux-android24-clang"
+          [target.armv7-linux-androideabi]
+          linker = "$BIN/armv7a-linux-androideabi24-clang"
+          [target.i686-linux-android]
+          linker = "$BIN/i686-linux-android24-clang"
+          [target.x86_64-linux-android]
+          linker = "$BIN/x86_64-linux-android24-clang"
+
+          [env]
+          CC_aarch64_linux_android = "$BIN/aarch64-linux-android24-clang"
+          CXX_aarch64_linux_android = "$BIN/aarch64-linux-android24-clang++"
+          AR_aarch64_linux_android = "$BIN/llvm-ar"
+          EOF
+          cat "$CFG"
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Init Android project
+        run: npx tauri android init
+
+      - name: Inject Android VPN components
+        run: node scripts/inject-android-vpn.cjs
+
+      - name: Force-disable R8 minify
+        shell: bash
+        run: |
+          set -e
+          F=src-tauri/gen/android/app/build.gradle.kts
+          sed -i 's/isMinifyEnabled = true/isMinifyEnabled = false/g' "$F"
+          sed -i 's/isShrinkResources = true/isShrinkResources = false/g' "$F"
+          sed -i '/optimization/,/}/ s/enable = true/enable = false/' "$F"
+
+      - name: Ensure tauri.settings.gradle exists
+        shell: bash
+        run: |
+          set -e
+          F=src-tauri/gen/android/tauri.settings.gradle
+          if [ ! -f "$F" ]; then
+            echo "// placeholder: generated by tauri CLI" > "$F"
+          fi
+
+      - name: Sync Android launcher icons
+        run: |
+          set -e
+          RES=src-tauri/gen/android/app/src/main/res
+          test -d "$RES"
+          cp -rfv src-tauri/icons/android/. "$RES"/ | tail -20
+
+      - name: Build frontend
+        run: npm run build
+
+      - name: Fetch geo databases
+        run: node scripts/fetch-kernel.cjs --geo-only
+
+      - name: Build embedded Android kernels
+        working-directory: src-tauri/ios-kernel
+        shell: bash
+        run: |
+          set -e
+          go mod tidy
+          BIN="$NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          CGO_ENABLED=1 GOOS=android GOARCH=arm64 \
+            CC="$BIN/aarch64-linux-android24-clang" \
+            CGO_CFLAGS="--target=aarch64-linux-android24" \
+            CGO_LDFLAGS="--target=aarch64-linux-android24" \
+            go build -buildmode=c-shared \
+              -tags "with_gvisor,with_quic,with_grpc,with_wireguard,with_ech,with_utls,with_clash_api" \
+              -trimpath -ldflags="-s -w" \
+              -o "libprismkernel-arm64.so" .
+
+      - name: Stage Android kernel .so into jniLibs
+        shell: bash
+        run: |
+          set -e
+          JNI="src-tauri/gen/android/app/src/main/jniLibs"
+          mkdir -p "$JNI/arm64-v8a"
+          cp src-tauri/ios-kernel/libprismkernel-arm64.so "$JNI/arm64-v8a/"
+
+      - name: Build APK
+        run: npx tauri android build --apk --target aarch64 --verbose
+
+      - name: Sign APK
+        shell: bash
+        run: |
+          set -e
+          BT=$(ls -d "$ANDROID_HOME"/build-tools/* 2>/dev/null | sort -V | tail -1)
+          KS="$HOME/.android/prism-ci.keystore"
+          mkdir -p "$HOME/.android"
+          keytool -genkeypair -keystore "$KS" -storepass android -keypass android \
+            -alias prism -keyalg RSA -keysize 2048 -validity 10000 \
+            -dname "CN=Prism, OU=Mobile, O=Prism, L=NA, ST=NA, C=CN"
+
+          find src-tauri/gen/android/app/build/outputs/apk -name "*-unsigned.apk" -type f \
+            | while IFS= read -r apk; do
+              ALIGNED="${apk%-unsigned.apk}-aligned.apk"
+              SIGNED="${apk%-unsigned.apk}.apk"
+              "$BT/zipalign" -p -f 4 "$apk" "$ALIGNED"
+              "$BT/apksigner" sign --ks "$KS" \
+                --ks-pass pass:android --key-pass pass:android \
+                --ks-key-alias prism --out "$SIGNED" "$ALIGNED"
+              rm -f "$apk" "$ALIGNED"
+            done
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: Prism-android-apk
+          path: src-tauri/gen/android/app/build/outputs/apk/**/*.apk
+          if-no-files-found: error
+
+      - name: Upload APK to Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          repository: '你的主账号用户名/主仓库名'
+          token: ${{ secrets.REMOTE_PAT }}
+          tag_name: ${{ github.ref_name }}
+          draft: true
+          files: src-tauri/gen/android/app/build/outputs/apk/**/*.apk
+          fail_on_unmatched_files: false
+          overwrite_files: true
+
+  ios:
+    name: Build TrollStore IPA
+    runs-on: macos-15
+    steps:
+      # 跨账号拉取私有仓库代码
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ github.event.inputs.target_repo || '你的主账号用户名/主仓库名' }}
+          ref: ${{ github.event.inputs.target_ref || github.ref }}
+          token: ${{ secrets.REMOTE_PAT }}
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Select Xcode
+        run: sudo xcode-select -switch /Applications/Xcode.app
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+
+      - name: Fetch geo databases
+        run: node scripts/fetch-kernel.cjs --geo-only
+
+      - name: Build embedded iOS kernel
+        working-directory: src-tauri/ios-kernel
+        shell: bash
+        run: |
+          set -e
+          go mod tidy
+          SDK=$(xcrun -sdk iphoneos --show-sdk-path)
+          CC="$(xcrun -sdk iphoneos --find clang)" \
+          CGO_ENABLED=1 GOOS=ios GOARCH=arm64 \
+          CGO_CFLAGS="-isysroot $SDK -arch arm64 -miphoneos-version-min=13.0" \
+          CGO_LDFLAGS="-isysroot $SDK -arch arm64" \
+          go build -buildmode=c-archive \
+            -tags "netgo,with_gvisor,with_quic,with_grpc,with_wireguard,with_ech,with_utls,with_clash_api" \
+            -trimpath -ldflags="-s -w" \
+            -o libprismkernel.a .
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Init iOS project
+        run: npx tauri ios init
+
+      - name: Sync iOS app icons
+        shell: bash
+        run: |
+          set -e
+          ICONSET=$(find src-tauri/gen/apple -type d -name AppIcon.appiconset | head -1)
+          test -n "$ICONSET"
+          cp -fv src-tauri/icons/ios/*.png "$ICONSET"/
+
+      - name: Inject iOS VPN extension
+        run: |
+          gem list xcodeproj -i >/dev/null 2>&1 || sudo gem install xcodeproj --no-document
+          ruby scripts/inject-ios-vpn.rb
+
+      - name: Build unsigned IPA
+        run: npx tauri ios build --no-sign --verbose
+
+      - name: Prepare TrollStore IPA
+        id: ipa
+        run: |
+          set -e
+          IPA=$(find src-tauri/gen/apple -name "*.ipa" -type f | head -1)
+          test -n "$IPA"
+          WORK=$(mktemp -d)
+          unzip -q "$IPA" -d "$WORK"
+          APP=$(find "$WORK/Payload" -maxdepth 1 -name "*.app" -type d | head -1)
+          EXEC=$(/usr/libexec/PlistBuddy -c "Print :CFBundleExecutable" "$APP/Info.plist")
+          APPEX=$(find "$APP/PlugIns" -maxdepth 1 -name "*.appex" -type d 2>/dev/null | head -1)
+
+          for KEY in UISupportedInterfaceOrientations UISupportedInterfaceOrientations~ipad; do
+            plutil -remove "$KEY" "$APP/Info.plist" >/dev/null 2>&1 || true
+            plutil -insert "$KEY" -json '["UIInterfaceOrientationPortrait"]' "$APP/Info.plist"
+          done
+
+          if [ -n "$APPEX" ]; then
+            rm -rf "$APPEX/Frameworks"
+          fi
+
+          find "$APP" -name "*.dylib.original" -delete
+          find "$APP/Frameworks" -maxdepth 1 -type f -name "libswift*.dylib" \
+            ! -name "libswift_Concurrency.dylib" -delete 2>/dev/null || true
+
+          APP_VERSION=$(grep -m1 '^version' src-tauri/Cargo.toml | sed 's/version = "\(.*\)"/\1/')
+          BUILD_NUM=$((200 + ${GITHUB_RUN_NUMBER:-$(date +%s)}))
+          MAIN_BUNDLE=$(/usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$APP/Info.plist")
+
+          /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $BUILD_NUM" "$APP/Info.plist"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $APP_VERSION" "$APP/Info.plist"
+
+          if [ -n "$APPEX" ]; then
+            /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $BUILD_NUM" "$APPEX/Info.plist" 2>/dev/null || true
+            /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $APP_VERSION" "$APPEX/Info.plist" 2>/dev/null || true
+          fi
+
+          MAIN_EXEC_PATH="$APP/$EXEC"
+          chmod +x "$MAIN_EXEC_PATH"
+          RPATHS_RAW=$(mktemp)
+          otool -l "$MAIN_EXEC_PATH" | awk '/cmd LC_RPATH/ { want=1; next } want && /path / { sub(/^ *path /,""); sub(/ \(offset [0-9]+\).*/,""); print; want=0 }' > "$RPATHS_RAW"
+          while IFS= read -r rp; do
+            install_name_tool -delete_rpath "$rp" "$MAIN_EXEC_PATH"
+          done < "$RPATHS_RAW"
+          install_name_tool -add_rpath /usr/lib/swift "$MAIN_EXEC_PATH"
+          while IFS= read -r rp; do
+            [ "$rp" = "/usr/lib/swift" ] && continue
+            install_name_tool -add_rpath "$rp" "$MAIN_EXEC_PATH"
+          done < "$RPATHS_RAW"
+
+          HELPER_SRC="$PWD/src-tauri/mobile-src/ios/Helper/PrismHelper.swift"
+          HELPER_BIN="$APP/PrismHelper"
+          xcrun -sdk iphoneos swiftc -O \
+            -target arm64-apple-ios15.0 \
+            -parse-as-library \
+            -Xlinker -rpath -Xlinker /usr/lib/swift \
+            -Xlinker -rpath -Xlinker @executable_path/Frameworks \
+            -framework Foundation -framework CoreServices -framework Security \
+            -o "$HELPER_BIN" "$HELPER_SRC"
+
+          chmod +x "$HELPER_BIN"
+
+          LIST=$(mktemp)
+          find "$APP" -type f | while IFS= read -r f; do
+            if file "$f" | grep -q "Mach-O"; then echo "$f"; fi
+          done > "$LIST"
+
+          while IFS= read -r bin; do
+            [[ "$bin" == *".appex/"* ]] && continue
+            if [ "$bin" = "$APP/$EXEC" ] || [ "$bin" = "$APP/PrismHelper" ]; then
+              codesign --force --sign - \
+                --entitlements "$PWD/src-tauri/TrollStore.entitlements.plist" \
+                --generate-entitlement-der \
+                "$bin"
+            else
+              codesign --force --sign - "$bin"
+            fi
+          done < "$LIST"
+
+          if [ -n "$APPEX" ]; then
+            APPEX_EXEC=$(/usr/libexec/PlistBuddy -c "Print :CFBundleExecutable" "$APPEX/Info.plist")
+            chmod +x "$APPEX/$APPEX_EXEC"
+            codesign --force --sign - \
+              --entitlements "$PWD/src-tauri/gen/apple/PrismVPN/PrismVPN.entitlements.plist" \
+              "$APPEX/$APPEX_EXEC"
+            rm -rf "$APPEX/_CodeSignature"
+          fi
+
+          rm -f "$APP/embedded.mobileprovision" "$APPEX/embedded.mobileprovision" 2>/dev/null || true
+
+          OUT="$PWD/Prism-$APP_VERSION-TrollStore.ipa"
+          rm -f "$OUT"
+          (cd "$WORK" && zip -qry "$OUT" Payload)
+          echo "path=$OUT" >> "$GITHUB_OUTPUT"
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: Prism-TrollStore-ipa
+          path: Prism-*-TrollStore.ipa
+          if-no-files-found: error
+
+      - name: Upload IPA to Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          repository: '你的主账号用户名/主仓库名'
+          token: ${{ secrets.REMOTE_PAT }}
+          tag_name: ${{ github.ref_name }}
+          draft: true
+          files: Prism-*-TrollStore.ipa
+          fail_on_unmatched_files: false
+          overwrite_files: true
+
+  build-macos:
+    name: Build macOS DMG
+    runs-on: macos-14
+    steps:
+      # 跨账号拉取私有仓库代码
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ github.event.inputs.target_repo || '你的主账号用户名/主仓库名' }}
+          ref: ${{ github.event.inputs.target_ref || github.ref }}
+          token: ${{ secrets.REMOTE_PAT }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: |
+            aarch64-apple-darwin
+            x86_64-apple-darwin
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      - name: Install frontend deps
+        run: npm ci
+
+      - name: Fetch sing-box sidecar (aarch64)
+        run: node scripts/fetch-kernel.cjs --triplet aarch64-apple-darwin
+
+      - name: Fetch sing-box sidecar (x86_64)
+        run: node scripts/fetch-kernel.cjs --triplet x86_64-apple-darwin
+
+      - name: Build frontend
+        run: npm run build
+
+      - name: Build aarch64 DMG
+        run: npx tauri build --bundles dmg --target aarch64-apple-darwin
+
+      - name: Build x86_64 DMG
+        run: npx tauri build --bundles dmg --target x86_64-apple-darwin
+
+      - name: Rename DMGs with version
+        shell: bash
+        run: |
+          set -e
+          VERSION=$(grep -m1 '^version' src-tauri/Cargo.toml | sed 's/version = "\(.*\)"/\1/')
+          cd src-tauri/target
+          for TRIPLET in aarch64-apple-darwin x86_64-apple-darwin; do
+            for DMG in "$TRIPLET"/release/bundle/dmg/*.dmg; do
+              [ -f "$DMG" ] || continue
+              ARCH=$(echo "$TRIPLET" | sed 's/-apple-darwin//')
+              NEW="Prism_${VERSION}_macOS_${ARCH}.dmg"
+              mv -v "$DMG" "$NEW"
+            done
+          done
+
+      - name: Upload macOS DMG (aarch64)
+        uses: actions/upload-artifact@v4
+        with:
+          name: Prism-macos-dmg-aarch64
+          path: src-tauri/target/Prism_*_macOS_aarch64.dmg
+          if-no-files-found: error
+
+      - name: Upload macOS DMG (x86_64)
+        uses: actions/upload-artifact@v4
+        with:
+          name: Prism-macos-dmg-x86_64
+          path: src-tauri/target/Prism_*_macOS_x86_64.dmg
+          if-no-files-found: warn
+
+      - name: Upload DMG to Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          repository: '你的主账号用户名/主仓库名'
+          token: ${{ secrets.REMOTE_PAT }}
+          tag_name: ${{ github.ref_name }}
+          draft: true
+          files: |
+            src-tauri/target/Prism_*_macOS_aarch64.dmg
+            src-tauri/target/Prism_*_macOS_x86_64.dmg
+          fail_on_unmatched_files: false
+          overwrite_files: true
