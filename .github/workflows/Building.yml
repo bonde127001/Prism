@@ -50,15 +50,14 @@ jobs:
 
       - uses: actions/checkout@v4
         with:
-          repository: ${{ github.event.inputs.target_repo || github.repository }}
-          ref: ${{ github.event.inputs.target_ref || github.ref }}
+          repository: ${{ github.event.inputs.target_repo || 'chinaxsir/prism-Alpha' }}
+          ref: ${{ github.event.inputs.target_ref || 'main' }}
           token: ${{ secrets.REMOTE_PAT || github.token }}
 
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
           node-version: 20
-          cache: npm
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
@@ -125,7 +124,12 @@ jobs:
           cat "$CFG"
 
       - name: Install frontend dependencies
-        run: npm ci
+        run: |
+          if [ -f package-lock.json ]; then
+            npm ci || npm install
+          else
+            npm install
+          fi
 
       - name: Init Android project
         run: npx tauri android init
@@ -226,15 +230,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          repository: ${{ github.event.inputs.target_repo || github.repository }}
-          ref: ${{ github.event.inputs.target_ref || github.ref }}
+          repository: ${{ github.event.inputs.target_repo || 'chinaxsir/prism-Alpha' }}
+          ref: ${{ github.event.inputs.target_ref || 'main' }}
           token: ${{ secrets.REMOTE_PAT || github.token }}
 
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
           node-version: 20
-          cache: npm
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
@@ -274,7 +277,12 @@ jobs:
             -o libprismkernel.a .
 
       - name: Install frontend dependencies
-        run: npm ci
+        run: |
+          if [ -f package-lock.json ]; then
+            npm ci || npm install
+          else
+            npm install
+          fi
 
       - name: Init iOS project
         run: npx tauri ios init
@@ -411,15 +419,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          repository: ${{ github.event.inputs.target_repo || github.repository }}
-          ref: ${{ github.event.inputs.target_ref || github.ref }}
+          repository: ${{ github.event.inputs.target_repo || 'chinaxsir/prism-Alpha' }}
+          ref: ${{ github.event.inputs.target_ref || 'main' }}
           token: ${{ secrets.REMOTE_PAT || github.token }}
 
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
           node-version: 20
-          cache: npm
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
@@ -436,14 +443,18 @@ jobs:
         run: sudo xcode-select -switch /Applications/Xcode.app
 
       - name: Install frontend dependencies
-        run: npm ci
+        run: |
+          if [ -f package-lock.json ]; then
+            npm ci || npm install
+          else
+            npm install
+          fi
 
       - name: Fetch macOS kernel and geo databases
         shell: bash
         run: |
           set -e
           node scripts/fetch-kernel.cjs --target ${{ matrix.target }} || node scripts/fetch-kernel.cjs
-          # 确保外部二进制或资源目录中的 sing-box 具备可执行权限
           find src-tauri -type f -name "sing-box*" -exec chmod +x {} + 2>/dev/null || true
 
       - name: Build macOS App and DMG
@@ -454,18 +465,15 @@ jobs:
         run: |
           set -e
           APP_VERSION=$(grep -m1 '^version' src-tauri/Cargo.toml | sed 's/version = "\(.*\)"/\1/')
-          # 先构建 .app 应用包，避免 headless CI 下 Finder AppleScript 卡死导致整体失败
           npx tauri build --target ${{ matrix.target }} --bundles app --verbose
 
           APP_DIR="src-tauri/target/${{ matrix.target }}/release/bundle/macos"
           APP_BUNDLE=$(find "$APP_DIR" -maxdepth 1 -name "*.app" -type d | head -1)
           test -n "$APP_BUNDLE"
 
-          # 确保内嵌内核二进制具备执行权限并执行 Ad-hoc 深度签名
           find "$APP_BUNDLE" -type f -name "sing-box*" -exec chmod +x {} + 2>/dev/null || true
           codesign --force --deep --sign - "$APP_BUNDLE"
 
-          # 使用 hdiutil 稳定打包标准 macOS DMG 安装镜像（含 Applications 拖拽快捷方式）
           STAGE_DIR=$(mktemp -d)
           cp -R "$APP_BUNDLE" "$STAGE_DIR/"
           ln -s /Applications "$STAGE_DIR/Applications"
